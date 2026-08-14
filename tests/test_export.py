@@ -279,9 +279,22 @@ def test_track_bounded_by_clean_boundaries_is_complete(tmp_path: Path) -> None:
     _push_seconds(segmenter, 2_000_000, 2.0)
     segmenter.stream_end()
 
-    assert _exported(tmp_path) == ["Band - One.flac"]
-    # The last track ended because the stream stopped, so it stays unverified.
-    assert _partials(tmp_path) == ["Band - Two.flac"]
+    # The last track ended with the stream rather than on a boundary, but it
+    # captured its full reported duration, which settles the question.
+    assert _exported(tmp_path) == ["Band - One.flac", "Band - Two.flac"]
+    assert _partials(tmp_path) == []
+
+
+def test_stream_ending_mid_track_produces_a_partial(tmp_path: Path) -> None:
+    segmenter = _segmenter(tmp_path)
+    segmenter.push_metadata(
+        _metadata(0, title="One", artist="Band", progress_ms=0, duration_ms=10_000)
+    )
+    _push_seconds(segmenter, 0, 2.0)
+    segmenter.stream_end()
+
+    assert _exported(tmp_path) == []
+    assert _partials(tmp_path) == ["Band - One.flac"]
 
 
 def test_joining_mid_track_produces_a_partial(tmp_path: Path) -> None:
@@ -317,9 +330,7 @@ def test_skipping_before_the_end_produces_a_partial(tmp_path: Path) -> None:
 
 def test_live_stream_with_unknown_duration_is_judged_by_boundaries(tmp_path: Path) -> None:
     segmenter = _segmenter(tmp_path)
-    segmenter.push_metadata(
-        _metadata(0, title="One", artist="Radio", progress_ms=0, duration_ms=0)
-    )
+    segmenter.push_metadata(_metadata(0, title="One", artist="Radio", progress_ms=0, duration_ms=0))
     _push_seconds(segmenter, 0, 2.0)
     segmenter.push_metadata(
         _metadata(2_000_000, title="Two", artist="Radio", progress_ms=0, duration_ms=0)
@@ -491,8 +502,7 @@ def test_stream_clear_keeps_pending_boundaries(tmp_path: Path) -> None:
     segmenter.stream_end()
 
     assert [writer.tags.title for writer in _RecordingWriter.instances] == ["One", "Two"]
-    assert _exported(tmp_path) == ["Band - One.flac"]
-    assert _partials(tmp_path) == ["Band - Two.flac"]
+    assert _exported(tmp_path) == ["Band - One.flac", "Band - Two.flac"]
 
 
 def test_audio_older_than_the_oldest_boundary_is_not_mislabelled(tmp_path: Path) -> None:
@@ -511,5 +521,4 @@ def test_audio_older_than_the_oldest_boundary_is_not_mislabelled(tmp_path: Path)
     segmenter.stream_end()
 
     assert [writer.tags.title for writer in _RecordingWriter.instances] == ["Two", "Three"]
-    assert _exported(tmp_path) == ["Band - Two.flac"]
-    assert _partials(tmp_path) == ["Band - Three.flac"]
+    assert _exported(tmp_path) == ["Band - Three.flac", "Band - Two.flac"]

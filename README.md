@@ -322,7 +322,9 @@ Files are named `Artist - Title.<ext>` directly in the export directory. Charact
 
 **Tags written:** title, artist, album, album artist, year, and track number. Album art is not embedded.
 
-**The `.partial` subdirectory** holds captures that could not be verified as covering a whole track. A capture lands there when you join part-way into a song, skip before it ends, seek, the audio format changes mid-track, the stream stops mid-track, or the captured length disagrees with the duration the server reported. Tracks whose duration the server does not report (live streams) are judged purely by whether both ends fell on a track boundary.
+**The `.partial` subdirectory** holds captures that could not be verified as covering a whole track. When the server reports a track duration, that is what decides it: a capture whose length matches the reported duration is complete, and anything materially shorter or longer is partial. So joining part-way into a song, skipping before it ends, seeking, or a mid-track format change all land in `.partial`, while a track that played through to the end is complete even if it was the last one before the stream stopped. Tracks whose duration the server does not report (live streams) are judged instead by whether both ends fell on a track boundary.
+
+Run with `--log-level DEBUG` to see the reason a given capture was called partial.
 
 **Duplicates:** the first capture of a track wins. If a file of the same name already exists it is kept and the new capture is discarded, so replaying an album does not fill the directory with copies. A verified capture in the export directory also suppresses later partial captures of the same track.
 

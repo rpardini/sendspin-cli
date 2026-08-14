@@ -40,35 +40,35 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# Container formats accepted by --export-format.
 EXPORT_FORMATS: Final = ("flac", "aiff")
-"""Container formats accepted by ``--export-format``."""
 
+# How far behind the newest received chunk PCM is committed to the encoder.
 HOLDBACK_US: Final = 10_000_000
-"""How far behind the newest received chunk PCM is committed to the encoder."""
 
+# How far a boundary may miss a chunk edge before the split is called unclean.
 BOUNDARY_TOLERANCE_US: Final = 1_500_000
-"""How far a boundary may miss a chunk edge before the split is called unclean."""
 
+# How far captured audio may differ from the reported track duration.
 DURATION_TOLERANCE_MS: Final = 2_000
-"""How far captured audio may differ from the reported track duration."""
 
+# Backwards progress jump that marks a track restart rather than jitter.
 PROGRESS_RESET_TOLERANCE_MS: Final = 1_500
-"""Backwards progress jump that marks a track restart rather than a jitter."""
 
+# Bounded work queue; matches the audio worker so overload is bounded the same way.
 QUEUE_MAXSIZE: Final = 512
-"""Bounded work queue; matches the audio worker so overload is bounded the same way."""
 
+# Subdirectory holding captures that could not be verified as complete.
 PARTIAL_DIRNAME: Final = ".partial"
-"""Subdirectory holding captures that could not be verified as complete."""
 
+# Subdirectory holding in-progress files, so only finished files are visible.
 TMP_DIRNAME: Final = ".tmp"
-"""Subdirectory holding in-progress files, so only finished files are visible."""
 
+# UTF-8 byte budget for a filename stem, well under the usual 255-byte limit.
 MAX_NAME_BYTES: Final = 200
-"""UTF-8 byte budget for a filename stem, well under the usual 255-byte limit."""
 
+# Grace period for the export thread to flush its final file on shutdown.
 _JOIN_TIMEOUT_SECONDS: Final = 10.0
-"""Grace period for the export thread to flush its final file on shutdown."""
 
 # PCM bit depth -> FFmpeg sample format. FLAC accepts only s16 and s32.
 _SAMPLE_FMT: Final = {16: "s16", 24: "s32", 32: "s32"}
@@ -413,8 +413,11 @@ class Segmenter:
         tags = self._meta.snapshot(metadata.timestamp)
         progress_ms = self._meta.progress_ms
         logger.debug(
-            "Metadata at %d: %r progress=%s/%sms", metadata.timestamp, tags.identity,
-            progress_ms, tags.duration_ms,
+            "Metadata at %d: %r progress=%s/%sms",
+            metadata.timestamp,
+            tags.identity,
+            progress_ms,
+            tags.duration_ms,
         )
 
         if tags.identity == (None, None, None):
@@ -422,8 +425,8 @@ class Segmenter:
             return
 
         if self._is_new_track(tags, progress_ms, metadata.timestamp):
-            boundary_us = tags.track_start_us if tags.track_start_us is not None else (
-                metadata.timestamp
+            boundary_us = (
+                tags.track_start_us if tags.track_start_us is not None else (metadata.timestamp)
             )
             if self._active is None and not self._pending:
                 # Audio still held back belongs to the track being replaced, not to
@@ -602,17 +605,29 @@ class Segmenter:
             return
 
         captured_ms = writer.frames_written * 1000 // writer.sample_rate
-        partial = (
-            segment.degraded
-            or writer.degraded
-            or not segment.started_at_boundary
-            or not ended_at_boundary
-            or (
-                segment.tags.duration_ms > 0
-                and abs(captured_ms - segment.tags.duration_ms) > DURATION_TOLERANCE_MS
+        duration_ms = segment.tags.duration_ms
+        if segment.degraded or writer.degraded:
+            reason = "audio was dropped"
+        elif duration_ms > 0:
+            # Capturing the reported duration proves the track is whole, however
+            # its boundaries happened to be derived.
+            drift_ms = captured_ms - duration_ms
+            reason = (
+                f"captured {captured_ms}ms of {duration_ms}ms ({drift_ms:+d}ms)"
+                if abs(drift_ms) > DURATION_TOLERANCE_MS
+                else ""
             )
-        )
-        self._publish(writer, segment.tags, partial=partial)
+        elif not segment.started_at_boundary:
+            # Unknown duration (live stream): fall back to how the ends were cut.
+            reason = "start was not on a track boundary"
+        elif not ended_at_boundary:
+            reason = "end was not on a track boundary"
+        else:
+            reason = ""
+
+        if reason:
+            logger.debug("Marking %r partial: %s", segment.tags.identity, reason)
+        self._publish(writer, segment.tags, partial=bool(reason))
 
     def _publish(self, writer: TrackWriter, tags: TrackTags, *, partial: bool) -> None:
         """Move a finished temporary file to its destination, keeping the first capture."""

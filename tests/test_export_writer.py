@@ -182,8 +182,9 @@ def test_exporter_thread_writes_a_tagged_file(tmp_path: Path) -> None:
     asyncio.run(exporter.stop())
 
     assert (tmp_path / "Band - First.flac").is_file()
-    # The second track ended with the stream, so it cannot be verified as complete.
-    assert (tmp_path / PARTIAL_DIRNAME / "Band - Second.flac").is_file()
+    # Ended with the stream, but captured its full duration, so still complete.
+    assert (tmp_path / "Band - Second.flac").is_file()
+    assert not (tmp_path / PARTIAL_DIRNAME).exists()
     assert list((tmp_path / TMP_DIRNAME).iterdir()) == []
 
     decoded, stream, metadata = _decode(tmp_path / "Band - First.flac")
