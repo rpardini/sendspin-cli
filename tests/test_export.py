@@ -522,3 +522,111 @@ def test_audio_older_than_the_oldest_boundary_is_not_mislabelled(tmp_path: Path)
 
     assert [writer.tags.title for writer in _RecordingWriter.instances] == ["Two", "Three"]
     assert _exported(tmp_path) == ["Band - Three.flac", "Band - Two.flac"]
+
+
+# --- clock-paced commits ----------------------------------------------------
+
+
+class _FakeClock:
+    """A server clock the test advances by hand."""
+
+    def __init__(self, now_us: int = 0) -> None:
+        self.now = now_us
+        self.synced = True
+
+    def now_us(self) -> int:
+        return self.now
+
+    def is_synced(self) -> bool:
+        return self.synced
+
+
+def test_commits_are_paced_by_the_server_clock_not_by_lookahead(tmp_path: Path) -> None:
+    """A server streaming far ahead must not drag the commit front with it.
+
+    Music Assistant stamps metadata with wall-clock "now" while audio chunks carry
+    playout timestamps ~20s in the future. Pacing by lookahead put the commit front
+    ahead of every boundary, so each file lost its start and absorbed the next
+    track's opening.
+    """
+    clock = _FakeClock(now_us=0)
+    segmenter = _segmenter(tmp_path, holdback_us=5_000_000)
+    segmenter.set_clock(clock.now_us, clock.is_synced)
+
+    lookahead_us = 20_000_000
+    segmenter.push_metadata(
+        _metadata(0, title="One", artist="Band", progress_ms=0, duration_ms=10_000)
+    )
+
+    # The server pushes 20s of track one all at once, far ahead of playout.
+    _push_seconds(segmenter, 0, 10.0)
+    # Nothing has played yet, so nothing may be committed.
+    assert _RecordingWriter.instances == []
+
+    # Track two is announced at wall-clock time 10s, when it actually starts.
+    clock.now = 10_000_000
+    segmenter.push_metadata(
+        _metadata(10_000_000, title="Two", artist="Band", progress_ms=0, duration_ms=10_000)
+    )
+    _push_seconds(segmenter, 10_000_000, 10.0)
+    clock.now = 20_000_000 + lookahead_us
+    segmenter.stream_end()
+
+    first, second = _RecordingWriter.instances
+    assert first.tags.title == "One"
+    assert first.frames_written == 10 * RATE
+    assert second.tags.title == "Two"
+    assert second.frames_written == 10 * RATE
+    assert _exported(tmp_path) == ["Band - One.flac", "Band - Two.flac"]
+
+
+def test_unsynchronized_clock_falls_back_to_lookahead_pacing(tmp_path: Path) -> None:
+    clock = _FakeClock(now_us=0)
+    clock.synced = False
+    segmenter = _segmenter(tmp_path, holdback_us=0)
+    segmenter.set_clock(clock.now_us, clock.is_synced)
+
+    segmenter.push_metadata(
+        _metadata(0, title="One", artist="Band", progress_ms=0, duration_ms=2000)
+    )
+    _push_seconds(segmenter, 0, 2.0)
+
+    # The clock never moved; without the fallback nothing would be committed.
+    assert _RecordingWriter.instances[0].frames_written == 2 * RATE
+
+
+def test_held_audio_is_capped_when_the_clock_stalls(tmp_path: Path) -> None:
+    clock = _FakeClock(now_us=0)
+    segmenter = _segmenter(tmp_path, holdback_us=5_000_000)
+    segmenter.set_clock(clock.now_us, clock.is_synced)
+
+    segmenter.push_metadata(
+        _metadata(0, title="One", artist="Band", progress_ms=0, duration_ms=120_000)
+    )
+    # Push well past the cap while the clock stays at zero.
+    _push_seconds(segmenter, 0, 90.0, chunk_ms=1000)
+
+    # Everything beyond MAX_HOLD_US is committed rather than buffered for ever.
+    assert _RecordingWriter.instances[0].frames_written == 30 * RATE
+
+
+def test_restated_track_position_refines_the_pending_boundary(tmp_path: Path) -> None:
+    """A server correcting a not-yet-applied boundary must not create two segments."""
+    clock = _FakeClock(now_us=0)
+    segmenter = _segmenter(tmp_path, holdback_us=1_000_000)
+    segmenter.set_clock(clock.now_us, clock.is_synced)
+
+    # Announced 7s in, then restarted and re-announced 0.8s in, as Music Assistant
+    # does when it restarts a track for a joining client.
+    segmenter.push_metadata(
+        _metadata(7_000_000, title="One", artist="Band", progress_ms=7000, duration_ms=10_000)
+    )
+    segmenter.push_metadata(
+        _metadata(10_800_000, title="One", artist="Band", progress_ms=800, duration_ms=10_000)
+    )
+    _push_seconds(segmenter, 10_000_000, 10.0)
+    clock.now = 30_000_000
+    segmenter.stream_end()
+
+    assert len(_RecordingWriter.instances) == 1
+    assert _RecordingWriter.instances[0].tags.title == "One"

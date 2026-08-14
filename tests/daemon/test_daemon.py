@@ -145,6 +145,12 @@ class _MetadataFakeClient:
     def __init__(self) -> None:
         self.metadata_listeners: list[object] = []
 
+    def now_us(self) -> int:
+        return 0
+
+    def is_time_synchronized(self) -> bool:
+        return True
+
     def add_server_command_listener(self, callback: object):
         return lambda: None
 
@@ -163,12 +169,16 @@ class _MetadataFakeClient:
 class _StubExporter:
     def __init__(self) -> None:
         self.resets = 0
+        self.clocks: list[tuple[object, object]] = []
 
     def handle_metadata(self, payload: object) -> None:
         return
 
     def notify_reset(self) -> None:
         self.resets += 1
+
+    def set_clock(self, now_us: object, is_clock_synced: object) -> None:
+        self.clocks.append((now_us, is_clock_synced))
 
 
 def test_attach_registers_and_detach_removes_the_metadata_listener(tmp_path: Path) -> None:
@@ -182,6 +192,7 @@ def test_attach_registers_and_detach_removes_the_metadata_listener(tmp_path: Pat
 
     daemon._attach_client(client)
     assert client.metadata_listeners == [exporter.handle_metadata]
+    assert exporter.clocks == [(client.now_us, client.is_time_synchronized)]
 
     daemon._detach_client()
     assert client.metadata_listeners == []

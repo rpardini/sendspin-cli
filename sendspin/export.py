@@ -5,9 +5,11 @@ sync, so exported files contain the PCM exactly as the server sent it. Track
 boundaries come from ``server/state`` metadata: its ``timestamp`` shares the server
 clock with audio chunk timestamps, so a boundary can be cut sample-accurately.
 
-Chunks are held back for :data:`HOLDBACK_US` before being committed to the encoder.
-Audio arrives several seconds ahead of playout, so without a holdback a server that
-announces metadata at playout time would describe audio we already wrote.
+Commits are paced by the synchronized server clock: audio is written only once it
+has played, plus :data:`HOLDBACK_US`. Chunks carry playout timestamps and can arrive
+tens of seconds early, while servers differ over whether a metadata timestamp means
+the playout instant or the moment of the announcement. Pacing by the clock rather
+than by how far ahead audio has arrived keeps both in the same frame.
 """
 
 from __future__ import annotations
@@ -43,8 +45,14 @@ logger = logging.getLogger(__name__)
 # Container formats accepted by --export-format.
 EXPORT_FORMATS: Final = ("flac", "aiff")
 
-# How far behind the newest received chunk PCM is committed to the encoder.
+# How long after audio has played it is committed to the encoder. Servers vary in
+# whether metadata timestamps refer to the playout instant or to the moment the
+# announcement was made, and this margin absorbs the difference either way.
 HOLDBACK_US: Final = 10_000_000
+
+# Ceiling on held audio, so a stopped or unsynchronized clock cannot grow the
+# buffer without bound. Reached only with a server that streams very far ahead.
+MAX_HOLD_US: Final = 60_000_000
 
 # How far a boundary may miss a chunk edge before the split is called unclean.
 BOUNDARY_TOLERANCE_US: Final = 1_500_000
@@ -393,6 +401,8 @@ class Segmenter:
         self._format = export_format
         self._writer_factory: WriterFactory = writer_factory or TrackWriter
         self._holdback_us = holdback_us
+        self._now_us: Callable[[], int] | None = None
+        self._is_clock_synced: Callable[[], bool] | None = None
 
         self._meta = _MetadataState()
         self._buffer: deque[_PcmChunk] = deque()
@@ -434,7 +444,12 @@ class Segmenter:
                 # a boundary already pending, that audio predates the outgoing track
                 # too, so it is left unnamed instead.
                 self._active = _Segment(tags=outgoing, started_at_boundary=False)
-            self._pending.append((boundary_us, tags))
+            if self._pending and self._pending[-1][1].identity == tags.identity:
+                # The same track announced twice before any of its audio was
+                # committed is a correction, not a repeat: keep the newer position.
+                self._pending[-1] = (boundary_us, tags)
+            else:
+                self._pending.append((boundary_us, tags))
             # Servers may reorder rarely; keep boundaries in playout order.
             if len(self._pending) > 1:
                 self._pending = deque(sorted(self._pending, key=lambda item: item[0]))
@@ -458,7 +473,28 @@ class Segmenter:
         if chunk.frames == 0:
             return
         self._buffer.append(chunk)
-        self._drain(chunk.end_us - self._holdback_us)
+        self._drain(self._horizon(chunk))
+
+    def set_clock(
+        self, now_us: Callable[[], int] | None, is_clock_synced: Callable[[], bool] | None
+    ) -> None:
+        """Supply the synchronized server clock used to pace commits."""
+        self._now_us = now_us
+        self._is_clock_synced = is_clock_synced
+
+    def _horizon(self, newest: _PcmChunk) -> int:
+        """Return the playout time up to which audio may be committed.
+
+        Chunks carry playout timestamps and can arrive tens of seconds early, while
+        many servers stamp metadata with the wall-clock moment of the announcement.
+        Pacing commits by the server clock rather than by how far ahead audio has
+        arrived puts both in the same frame, so boundaries land where they belong.
+        """
+        horizon = newest.end_us - self._holdback_us
+        if self._now_us is not None and (self._is_clock_synced is None or self._is_clock_synced()):
+            horizon = min(horizon, self._now_us() - self._holdback_us)
+        # Never hold more than the cap, whatever the clock says.
+        return max(horizon, newest.end_us - MAX_HOLD_US)
 
     def discontinuity(self) -> None:
         """Handle ``stream/clear``: buffered audio was discarded, so drop it too.
@@ -681,6 +717,14 @@ class _StreamEndItem:
 
 
 @dataclass(slots=True)
+class _ClockItem:
+    """The synchronized server clock to pace commits by."""
+
+    now_us: Callable[[], int] | None
+    is_clock_synced: Callable[[], bool] | None
+
+
+@dataclass(slots=True)
 class _ResetItem:
     """The client detached; flush and forget all metadata."""
 
@@ -691,7 +735,13 @@ class _StopItem:
 
 
 type _ExportWorkItem = (
-    _PcmItem | _MetadataItem | _DiscontinuityItem | _StreamEndItem | _ResetItem | _StopItem
+    _PcmItem
+    | _MetadataItem
+    | _DiscontinuityItem
+    | _StreamEndItem
+    | _ClockItem
+    | _ResetItem
+    | _StopItem
 )
 
 
@@ -768,7 +818,14 @@ class TrackExporter:
 
     def notify_reset(self) -> None:
         """Flush and forget all metadata, for a disconnect or server switch."""
+        self._enqueue(_ClockItem(None, None))
         self._enqueue(_ResetItem())
+
+    def set_clock(
+        self, now_us: Callable[[], int] | None, is_clock_synced: Callable[[], bool] | None
+    ) -> None:
+        """Supply the client's synchronized server clock, used to pace commits."""
+        self._enqueue(_ClockItem(now_us, is_clock_synced))
 
     def handle_metadata(self, payload: ServerStatePayload) -> None:
         """Accept a ``server/state`` metadata update from the event loop."""
@@ -831,5 +888,7 @@ class TrackExporter:
             segmenter.discontinuity()
         elif isinstance(item, _StreamEndItem):
             segmenter.stream_end()
+        elif isinstance(item, _ClockItem):
+            segmenter.set_clock(item.now_us, item.is_clock_synced)
         elif isinstance(item, _ResetItem):
             segmenter.reset()

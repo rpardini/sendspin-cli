@@ -262,6 +262,9 @@ class SendspinDaemon:
             self._metadata_unsubscribe = client.add_metadata_listener(
                 self._exporter.handle_metadata
             )
+            # Commits are paced by the server clock so that boundaries derived from
+            # metadata timestamps line up with the audio they describe.
+            self._exporter.set_clock(client.now_us, client.is_time_synchronized)
         if MPRIS_AVAILABLE and self._args.use_mpris:
             self._mpris = SendspinMpris(client)
             self._mpris.start()
