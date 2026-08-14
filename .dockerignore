@@ -1,0 +1,17 @@
+# The Docker build only needs the packaging metadata and the sendspin package itself;
+# everything below is either huge, host-specific, or would needlessly bust the build cache.
+.git
+.github
+.idea
+.venv
+.mypy_cache
+.pytest_cache
+.ruff_cache
+**/__pycache__
+**/*.py[cod]
+**/*.so
+*.egg-info
+tests
+scripts
+Dockerfile
+.dockerignore
