@@ -331,6 +331,7 @@ Run with `--log-level DEBUG` to see the reason a given capture was called partia
 Notes and limitations:
 
 - Daemon mode only, and it requires the server to send track metadata — the daemon requests the `metadata` role automatically when export is enabled. Audio that arrives with no track title is discarded, since there would be nothing to name the file after.
+- The first track captured after connecting may lose its opening second or so. Servers commonly announce a track change a moment after it has already started, quoting a stale position; that lateness is corrected from the previous track's known start and duration, which the first track does not have. Later tracks are unaffected.
 - Files appear about ten seconds after a track finishes playing. Audio can arrive tens of seconds ahead of playout, so the exporter writes it only once it has actually played — that keeps track boundaries aligned with the audio they describe, whether the server timestamps metadata at the playout instant or at the moment it announces the change.
 - FLAC caps out at 24 bits per sample, so a 32-bit source is written as 24-bit. Use `--export-format aiff` to keep all 32 bits.
 - Nothing limits how much is written. A long-running daemon will keep filling the disk.

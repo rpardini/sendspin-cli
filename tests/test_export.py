@@ -9,6 +9,7 @@ from aiosendspin.models.types import AudioCodec, undefined_field
 
 from sendspin.export import (
     PARTIAL_DIRNAME,
+    _progress_is_sane,
     TMP_DIRNAME,
     Segmenter,
     TrackTags,
@@ -170,7 +171,7 @@ def test_explicit_none_clears_a_field(tmp_path: Path) -> None:
 
 def test_boundary_splits_a_chunk_at_the_exact_frame(tmp_path: Path) -> None:
     segmenter = _segmenter(tmp_path)
-    segmenter.push_metadata(_metadata(0, title="One", artist="A", progress_ms=0, duration_ms=1000))
+    segmenter.push_metadata(_metadata(0, title="One", artist="A", progress_ms=0, duration_ms=500))
     # Boundary lands 500ms into a 1s chunk.
     segmenter.push_metadata(
         _metadata(500_000, title="Two", artist="A", progress_ms=0, duration_ms=1000)
@@ -630,3 +631,85 @@ def test_restated_track_position_refines_the_pending_boundary(tmp_path: Path) ->
 
     assert len(_RecordingWriter.instances) == 1
     assert _RecordingWriter.instances[0].tags.title == "One"
+
+
+# --- boundary correction ----------------------------------------------------
+
+
+def test_late_announcement_is_corrected_to_the_previous_track_end(tmp_path: Path) -> None:
+    """Servers announce a change mid-transition and can quote a stale position.
+
+    Music Assistant's announcements measured ~1.05s later than its own mid-track
+    reports, so each file lost its opening and picked up its successor's. The
+    outgoing track's start plus its duration predicts the same instant, and is
+    preferred when the two agree closely.
+    """
+    segmenter = _segmenter(tmp_path)
+    segmenter.push_metadata(
+        _metadata(0, title="One", artist="Band", progress_ms=0, duration_ms=10_000)
+    )
+    # A calm mid-track report confirms the track began at 0.
+    segmenter.push_metadata(_metadata(5_000_000, progress_ms=5000, duration_ms=10_000))
+    # The change is announced 1.05s late: at 11.05s it claims to be 0s into "Two".
+    segmenter.push_metadata(
+        _metadata(11_050_000, title="Two", artist="Band", progress_ms=0, duration_ms=10_000)
+    )
+    _push_seconds(segmenter, 0, 20.0)
+    segmenter.stream_end()
+
+    first, second = _RecordingWriter.instances
+    # Cut at 10s, where "One" actually ended, not at the announced 11.05s.
+    assert first.frames_written == 10 * RATE
+    assert second.frames_written == 10 * RATE
+    assert _exported(tmp_path) == ["Band - One.flac", "Band - Two.flac"]
+
+
+def test_distant_announcement_is_trusted_over_the_prediction(tmp_path: Path) -> None:
+    """A genuine skip must not be dragged to where the track would have ended."""
+    segmenter = _segmenter(tmp_path)
+    segmenter.push_metadata(
+        _metadata(0, title="One", artist="Band", progress_ms=0, duration_ms=60_000)
+    )
+    # Skipped 8s in, far beyond the correction window.
+    segmenter.push_metadata(
+        _metadata(8_000_000, title="Two", artist="Band", progress_ms=0, duration_ms=10_000)
+    )
+    _push_seconds(segmenter, 0, 12.0)
+    segmenter.stream_end()
+
+    first, _second = _RecordingWriter.instances
+    # Cut where the skip was announced, not at the 60s the duration implied.
+    assert first.frames_written == 8 * RATE
+    assert "Band - One.flac" in _partials(tmp_path)
+    assert _exported(tmp_path) == []
+
+
+def test_position_beyond_the_track_duration_is_ignored(tmp_path: Path) -> None:
+    """A server quoting the previous item's position must not place a boundary."""
+    segmenter = _segmenter(tmp_path, holdback_us=0)
+    # progress far exceeds duration: stale, and would put the boundary 65s in the past.
+    segmenter.push_metadata(
+        _metadata(100_000_000, title="One", artist="Band", progress_ms=280_000, duration_ms=215_000)
+    )
+    _push_seconds(segmenter, 100_000_000, 2.0)
+    segmenter.stream_end()
+
+    assert len(_RecordingWriter.instances) == 1
+    # Fell back to the announcement time, so the audio was still captured.
+    assert _RecordingWriter.instances[0].frames_written == 2 * RATE
+
+
+@pytest.mark.parametrize(
+    ("progress_ms", "duration_ms", "expected"),
+    [
+        (0, 10_000, True),
+        (9_000, 10_000, True),
+        (11_000, 10_000, True),  # within the sanity margin
+        (280_000, 215_000, False),
+        (None, 10_000, False),
+        (-1, 10_000, False),
+        (999_999, 0, True),  # unknown duration cannot contradict anything
+    ],
+)
+def test_progress_sanity(progress_ms: int | None, duration_ms: int, expected: bool) -> None:
+    assert _progress_is_sane(progress_ms, duration_ms) is expected

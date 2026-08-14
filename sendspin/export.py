@@ -63,6 +63,14 @@ DURATION_TOLERANCE_MS: Final = 2_000
 # Backwards progress jump that marks a track restart rather than jitter.
 PROGRESS_RESET_TOLERANCE_MS: Final = 1_500
 
+# How far a reported position may overrun the track duration before it is treated
+# as stale. Servers can quote the previous track's position during a change.
+PROGRESS_SANITY_MARGIN_MS: Final = 2_000
+
+# How far the outgoing track's predicted end may sit from the announced boundary
+# and still be preferred over it. Beyond this the prediction is not credible.
+BOUNDARY_CORRECTION_US: Final = 5_000_000
+
 # Bounded work queue; matches the audio worker so overload is bounded the same way.
 QUEUE_MAXSIZE: Final = 512
 
@@ -102,6 +110,13 @@ def _merged(value: _T | None | UndefinedField, current: _T | None) -> _T | None:
     if isinstance(value, UndefinedField):
         return current
     return value
+
+
+def _progress_is_sane(progress_ms: int | None, duration_ms: int) -> bool:
+    """Return whether a reported position can be trusted to place a boundary."""
+    if progress_ms is None or progress_ms < 0:
+        return False
+    return duration_ms <= 0 or progress_ms <= duration_ms + PROGRESS_SANITY_MARGIN_MS
 
 
 def sanitize_component(value: str) -> str:
@@ -412,6 +427,7 @@ class Segmenter:
         self._progress_ms: int | None = None
         self._progress_at_us: int | None = None
         self._progress_speed = 1000
+        self._track_start_us: int | None = None
         self._audio_format: AudioFormat | None = None
         self._last_committed_us: int | None = None
         self._sequence = 0
@@ -435,9 +451,7 @@ class Segmenter:
             return
 
         if self._is_new_track(tags, progress_ms, metadata.timestamp):
-            boundary_us = (
-                tags.track_start_us if tags.track_start_us is not None else (metadata.timestamp)
-            )
+            boundary_us = self._boundary_for(metadata, tags, outgoing)
             if self._active is None and not self._pending:
                 # Audio still held back belongs to the track being replaced, not to
                 # the one just announced. Tag it before the new tags take over. With
@@ -454,12 +468,54 @@ class Segmenter:
             if len(self._pending) > 1:
                 self._pending = deque(sorted(self._pending, key=lambda item: item[0]))
             logger.debug("Track boundary queued at %d: %r", boundary_us, tags.identity)
+            self._track_start_us = boundary_us
         elif self._active is not None and self._active.tags.identity == tags.identity:
             # Duration often arrives after the track has already started.
             self._active.tags = replace(self._active.tags, duration_ms=tags.duration_ms)
 
+        if tags.track_start_us is not None and _progress_is_sane(progress_ms, tags.duration_ms):
+            # Every sane report re-estimates where this track began. Mid-track ones
+            # are calmer than the announcement made during a change, so the latest
+            # is the best basis for placing this track's end.
+            self._track_start_us = tags.track_start_us
+
         self._identity = tags.identity
         self._remember_progress(progress_ms, metadata.timestamp)
+
+    def _boundary_for(
+        self, metadata: SessionUpdateMetadata, tags: TrackTags, outgoing: TrackTags
+    ) -> int:
+        """Return where the incoming track starts, in server clock time.
+
+        The announcement itself carries ``timestamp - progress``, but servers make it
+        while mid-change and the progress they quote can be stale by seconds. When the
+        outgoing track's start and duration are both known they predict the same
+        instant independently, so a close prediction is preferred over the quote.
+        """
+        announced_us = metadata.timestamp
+        if tags.track_start_us is not None and _progress_is_sane(
+            self._meta.progress_ms, tags.duration_ms
+        ):
+            announced_us = tags.track_start_us
+        else:
+            logger.debug(
+                "Ignoring implausible progress %sms of %sms; using the announcement time",
+                self._meta.progress_ms,
+                tags.duration_ms,
+            )
+
+        if self._track_start_us is None or outgoing.duration_ms <= 0:
+            return announced_us
+        expected_us = self._track_start_us + outgoing.duration_ms * 1000
+        drift_us = announced_us - expected_us
+        if abs(drift_us) > BOUNDARY_CORRECTION_US:
+            return announced_us
+        logger.debug(
+            "Placing boundary at the end of %r, %+.3fs from the announcement",
+            outgoing.identity,
+            drift_us / 1_000_000,
+        )
+        return expected_us
 
     def push_pcm(self, server_timestamp_us: int, data: bytes | bytearray, fmt: AudioFormat) -> None:
         """Buffer one decoded PCM chunk and commit whatever has aged past the holdback."""
@@ -506,6 +562,7 @@ class Segmenter:
         self._buffer.clear()
         self._finalize(ended_at_boundary=False)
         self._progress_ms = None
+        self._track_start_us = None
 
     def stream_end(self) -> None:
         """Commit everything still held and close the current file."""
@@ -526,6 +583,7 @@ class Segmenter:
         self._meta.reset()
         self._identity = None
         self._progress_ms = None
+        self._track_start_us = None
         self._pending.clear()
 
     def mark_degraded(self) -> None:
@@ -661,8 +719,13 @@ class Segmenter:
         else:
             reason = ""
 
-        if reason:
-            logger.debug("Marking %r partial: %s", segment.tags.identity, reason)
+        logger.debug(
+            "Finalizing %r: captured %dms of %sms%s",
+            segment.tags.identity,
+            captured_ms,
+            duration_ms or "unknown ",
+            f"; partial because {reason}" if reason else "; complete",
+        )
         self._publish(writer, segment.tags, partial=bool(reason))
 
     def _publish(self, writer: TrackWriter, tags: TrackTags, *, partial: bool) -> None:
