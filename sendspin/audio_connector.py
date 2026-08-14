@@ -9,7 +9,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
 
 from aiosendspin.models.core import StreamStartMessage
 from aiosendspin.models.types import AudioCodec, ClientStateType
@@ -76,6 +76,26 @@ type _AudioWorkItem = (
 )
 
 
+@runtime_checkable
+class PcmTap(Protocol):
+    """Observer of decoded PCM and stream lifecycle, in playout order.
+
+    Lifecycle notifications travel the same worker queue as the audio itself, so a
+    tap never sees a clear or an end out of order with the chunks around it.
+    """
+
+    def write_pcm(
+        self, server_timestamp_us: int, data: bytes | bytearray, fmt: AudioFormat
+    ) -> None:
+        """Receive one decoded PCM chunk, before playback alters it."""
+
+    def notify_discontinuity(self) -> None:
+        """Buffered audio was discarded upstream, e.g. for a seek."""
+
+    def notify_stream_end(self) -> None:
+        """The stream stopped; no more audio follows until it restarts."""
+
+
 class _AudioSyncWorker:
     """Owns AudioPlayer + decode pipeline on a dedicated thread."""
 
@@ -86,14 +106,48 @@ class _AudioSyncWorker:
         use_software_volume: bool,
         volume: int,
         muted: bool,
+        pcm_tap: PcmTap | None = None,
     ) -> None:
         self._audio_device = audio_device
         self._use_software_volume = use_software_volume
         self._initial_volume = volume
         self._initial_muted = muted
+        self._pcm_tap = pcm_tap
 
         self._queue: queue.Queue[_AudioWorkItem] | None = None
         self._thread: threading.Thread | None = None
+
+    def _tap_pcm(
+        self, server_timestamp_us: int, payload: bytes | bytearray, fmt: AudioFormat
+    ) -> None:
+        """Forward decoded PCM to the tap, never letting it break playback."""
+        tap = self._pcm_tap
+        if tap is None:
+            return
+        try:
+            tap.write_pcm(server_timestamp_us, payload, fmt)
+        except Exception:
+            logger.exception("PCM tap failed on audio chunk")
+
+    def _tap_discontinuity(self) -> None:
+        """Tell the tap that buffered audio was discarded."""
+        tap = self._pcm_tap
+        if tap is None:
+            return
+        try:
+            tap.notify_discontinuity()
+        except Exception:
+            logger.exception("PCM tap failed on discontinuity")
+
+    def _tap_stream_end(self) -> None:
+        """Tell the tap that the stream stopped."""
+        tap = self._pcm_tap
+        if tap is None:
+            return
+        try:
+            tap.notify_stream_end()
+        except Exception:
+            logger.exception("PCM tap failed on stream end")
 
     def start(
         self,
@@ -217,10 +271,12 @@ class _AudioSyncWorker:
 
             if item_type is _ClearWorkItem:
                 player.clear()
+                self._tap_discontinuity()
                 continue
 
             if item_type is _CloseStreamWorkItem:
                 player.close_stream()
+                self._tap_stream_end()
                 current_format = None  # force set_format() when next track begins
                 continue
 
@@ -256,13 +312,16 @@ class _AudioSyncWorker:
                     drain_type = type(drain_item)
                     if drain_type is _StopWorkItem:
                         player.stop()
+                        self._tap_stream_end()
                         return
                     if drain_type is _ClearWorkItem or drain_type is _CloseStreamWorkItem:
                         if drain_type is _CloseStreamWorkItem:
                             player.close_stream()
+                            self._tap_stream_end()
                             close_requested = True
                         else:
                             player.clear()
+                            self._tap_discontinuity()
                         buffered_chunks.clear()
                         drained = True
                         break
@@ -282,6 +341,7 @@ class _AudioSyncWorker:
                 if not drained:
                     logger.warning("Drain timeout during format switch; forcing clear")
                     player.clear()
+                    self._tap_discontinuity()
 
                 if close_requested:
                     current_format = None
@@ -313,6 +373,7 @@ class _AudioSyncWorker:
                         payload = flac_decoder.decode(payload)
                         if not payload:
                             continue
+                    self._tap_pcm(buffered.server_timestamp_us, payload, fmt)
                     player.submit(buffered.server_timestamp_us, payload)
                 continue
 
@@ -324,9 +385,12 @@ class _AudioSyncWorker:
                 if not payload:
                     continue
 
+            # Tap before submit: submit() may drop fully overlapping chunks.
+            self._tap_pcm(chunk_item.server_timestamp_us, payload, fmt)
             player.submit(chunk_item.server_timestamp_us, payload)
 
         player.stop()
+        self._tap_stream_end()
 
 
 class AudioStreamHandler:
@@ -350,6 +414,7 @@ class AudioStreamHandler:
         on_format_change: Callable[[str | None, int, int, int], None] | None = None,
         on_volume_change: Callable[[int, bool], None] | None = None,
         volume_controller: VolumeController | None = None,
+        pcm_tap: PcmTap | None = None,
     ) -> None:
         """Initialize the audio stream handler.
 
@@ -361,6 +426,7 @@ class AudioStreamHandler:
             on_format_change: Callback for format changes (codec, sample_rate, bit_depth, channels).
             on_volume_change: Callback for volume changes.
             volume_controller: Optional external volume controller backend.
+            pcm_tap: Optional observer of decoded PCM and stream lifecycle.
         """
         self._audio_device = audio_device
         self._volume = volume
@@ -380,6 +446,7 @@ class AudioStreamHandler:
 
         self._volume_controller: VolumeController | None = volume_controller
         self._chunks_dropping = False
+        self._pcm_tap = pcm_tap
 
     @property
     def volume(self) -> int:
@@ -488,6 +555,7 @@ class AudioStreamHandler:
                 use_software_volume=not self.uses_external_volume_controller,
                 volume=self._volume,
                 muted=self._muted,
+                pcm_tap=self._pcm_tap,
             )
 
         self._audio_worker.start(

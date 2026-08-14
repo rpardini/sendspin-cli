@@ -4,7 +4,7 @@ import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
-from aiosendspin.models.types import PlayerCommand
+from aiosendspin.models.types import PlayerCommand, Roles
 
 from sendspin.daemon.daemon import DaemonArgs, SendspinDaemon
 from sendspin.settings import ClientSettings
@@ -100,3 +100,101 @@ def test_set_static_delay_uses_applied_tracker_for_delta(tmp_path: Path) -> None
     assert daemon._audio_handler.delay_changes == [-300_000]
     assert daemon._static_delay_ms == 200.0
     assert daemon._settings.static_delay_ms == 200.0
+
+
+def _export_daemon(tmp_path: Path, *, export_dir: Path | None, use_mpris: bool) -> SendspinDaemon:
+    settings = ClientSettings(_settings_file=tmp_path / "settings.json")
+    args = DaemonArgs(
+        audio_device=SimpleNamespace(index=0, name="Fake Device"),
+        client_id="test-client",
+        client_name="Test Client",
+        settings=settings,
+        use_mpris=use_mpris,
+        export_dir=export_dir,
+    )
+    return SendspinDaemon(args)
+
+
+def test_export_requests_the_metadata_role(tmp_path: Path) -> None:
+    daemon = _export_daemon(tmp_path, export_dir=tmp_path / "out", use_mpris=False)
+    daemon._exporter = object()
+
+    roles = daemon._client_roles()
+
+    assert Roles.PLAYER in roles
+    assert Roles.METADATA in roles
+    assert Roles.CONTROLLER not in roles
+
+
+def test_player_only_without_export_or_mpris(tmp_path: Path) -> None:
+    daemon = _export_daemon(tmp_path, export_dir=None, use_mpris=False)
+
+    assert daemon._client_roles() == [Roles.PLAYER]
+
+
+def test_metadata_role_is_requested_once_with_export_and_mpris(tmp_path: Path) -> None:
+    daemon = _export_daemon(tmp_path, export_dir=tmp_path / "out", use_mpris=True)
+    daemon._exporter = object()
+
+    roles = daemon._client_roles()
+
+    assert roles.count(Roles.METADATA) <= 1
+
+
+class _MetadataFakeClient:
+    def __init__(self) -> None:
+        self.metadata_listeners: list[object] = []
+
+    def add_server_command_listener(self, callback: object):
+        return lambda: None
+
+    def add_group_update_listener(self, callback: object):
+        return lambda: None
+
+    def add_metadata_listener(self, callback: object):
+        self.metadata_listeners.append(callback)
+
+        def unsubscribe() -> None:
+            self.metadata_listeners.remove(callback)
+
+        return unsubscribe
+
+
+class _StubExporter:
+    def __init__(self) -> None:
+        self.resets = 0
+
+    def handle_metadata(self, payload: object) -> None:
+        return
+
+    def notify_reset(self) -> None:
+        self.resets += 1
+
+
+def test_attach_registers_and_detach_removes_the_metadata_listener(tmp_path: Path) -> None:
+    daemon = _export_daemon(tmp_path, export_dir=tmp_path / "out", use_mpris=False)
+    exporter = _StubExporter()
+    daemon._exporter = exporter
+    daemon._audio_handler = SimpleNamespace(
+        attach_client=lambda client: None, detach_client=lambda: None
+    )
+    client = _MetadataFakeClient()
+
+    daemon._attach_client(client)
+    assert client.metadata_listeners == [exporter.handle_metadata]
+
+    daemon._detach_client()
+    assert client.metadata_listeners == []
+    assert exporter.resets == 1
+
+
+def test_no_metadata_listener_without_export(tmp_path: Path) -> None:
+    daemon = _export_daemon(tmp_path, export_dir=None, use_mpris=False)
+    daemon._audio_handler = SimpleNamespace(
+        attach_client=lambda client: None, detach_client=lambda: None
+    )
+    client = _MetadataFakeClient()
+
+    daemon._attach_client(client)
+
+    assert client.metadata_listeners == []

@@ -25,11 +25,14 @@ from aiosendspin.models.types import (
 
 from sendspin.audio_devices import AudioDevice, detect_supported_audio_formats
 from sendspin.audio_connector import AudioStreamHandler
+from sendspin.export import TrackExporter
 from sendspin.hooks import run_hook
 from sendspin.settings import ClientSettings
 from sendspin.utils import create_task, get_device_info
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from sendspin.volume_controller import VolumeController
 
 logger = logging.getLogger(__name__)
@@ -54,6 +57,8 @@ class DaemonArgs:
     manufacturer: str | None = None
     product_name: str | None = None
     interface: str | None = None
+    export_dir: Path | None = None
+    export_format: str = "flac"
 
 
 class SendspinDaemon:
@@ -81,13 +86,26 @@ class SendspinDaemon:
         self._server_url: str | None = None
         self._group_update_unsubscribe: Callable[[], None] | None = None
         self._server_command_unsubscribe: Callable[[], None] | None = None
+        self._metadata_unsubscribe: Callable[[], None] | None = None
+        self._exporter: TrackExporter | None = None
+
+    def _client_roles(self) -> list[Roles]:
+        """Return the roles to request, based on which features are enabled."""
+        client_roles = [Roles.PLAYER]
+        # Export needs track metadata to name and split files; MPRIS needs it to
+        # publish now-playing. Either one is enough to ask for the role.
+        want_metadata = self._exporter is not None
+        if MPRIS_AVAILABLE and self._args.use_mpris:
+            client_roles.append(Roles.CONTROLLER)
+            want_metadata = True
+        if want_metadata:
+            client_roles.append(Roles.METADATA)
+        return client_roles
 
     def _create_client(self) -> SendspinClient:
         """Create a new SendspinClient instance."""
         assert self._audio_handler is not None
-        client_roles = [Roles.PLAYER]
-        if MPRIS_AVAILABLE and self._args.use_mpris:
-            client_roles.extend([Roles.METADATA, Roles.CONTROLLER])
+        client_roles = self._client_roles()
 
         supported_formats = detect_supported_audio_formats(self._args.audio_device)
         if self._args.preferred_format is not None:
@@ -139,6 +157,14 @@ class SendspinDaemon:
         )
         self._static_delay_ms = max(0.0, min(5000.0, delay))
 
+        # Started before the first client is created, so _client_roles() sees it.
+        if self._args.export_dir is not None:
+            self._exporter = TrackExporter(
+                export_dir=self._args.export_dir,
+                export_format=self._args.export_format,
+            )
+            self._exporter.start()
+
         self._audio_handler = AudioStreamHandler(
             audio_device=self._args.audio_device,
             volume=self._settings.player_volume,
@@ -147,6 +173,7 @@ class SendspinDaemon:
             on_format_change=self._handle_format_change,
             on_volume_change=self._on_volume_change,
             volume_controller=self._args.volume_controller,
+            pcm_tap=self._exporter,
         )
         await self._audio_handler.read_initial_volume()
         await self._audio_handler.start_volume_monitor()
@@ -165,7 +192,12 @@ class SendspinDaemon:
                 self._mpris.stop()
                 self._mpris = None
             if self._audio_handler is not None:
+                # Shutting the handler down first pushes a final stream-end through
+                # the audio worker, so the exporter flushes its last file.
                 await self._audio_handler.shutdown()
+            if self._exporter is not None:
+                await self._exporter.stop()
+                self._exporter = None
             if self._client is not None:
                 await self._client.disconnect()
                 self._client = None
@@ -226,6 +258,10 @@ class SendspinDaemon:
             self._handle_server_command
         )
         self._group_update_unsubscribe = client.add_group_update_listener(self._on_group_update)
+        if self._exporter is not None:
+            self._metadata_unsubscribe = client.add_metadata_listener(
+                self._exporter.handle_metadata
+            )
         if MPRIS_AVAILABLE and self._args.use_mpris:
             self._mpris = SendspinMpris(client)
             self._mpris.start()
@@ -238,6 +274,12 @@ class SendspinDaemon:
         if self._group_update_unsubscribe is not None:
             self._group_update_unsubscribe()
             self._group_update_unsubscribe = None
+        if self._metadata_unsubscribe is not None:
+            self._metadata_unsubscribe()
+            self._metadata_unsubscribe = None
+        if self._exporter is not None:
+            # Flush and forget tags, so a server switch cannot mislabel the next track.
+            self._exporter.notify_reset()
         if self._mpris is not None:
             self._mpris.stop()
             self._mpris = None

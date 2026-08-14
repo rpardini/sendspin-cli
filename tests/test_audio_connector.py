@@ -18,11 +18,13 @@ class _FakeWorker:
         use_software_volume: bool,
         volume: int,
         muted: bool,
+        pcm_tap: object | None = None,
     ) -> None:
         self.audio_device = audio_device
         self.use_software_volume = use_software_volume
         self.volume = volume
         self.muted = muted
+        self.pcm_tap = pcm_tap
         self.running = False
         self.cleared = False
         self.stream_closed = False
@@ -288,3 +290,149 @@ def test_stream_end_closes_stream_not_just_clears(monkeypatch) -> None:
 
     assert worker.stream_closed, "_on_stream_end must call close_stream(), not just clear()"
     assert not worker.cleared, "_on_stream_end must not call clear() separately"
+
+
+class _RecordingTap:
+    """Captures everything the audio worker reports to a PCM tap."""
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, object]] = []
+
+    def write_pcm(self, server_timestamp_us: int, data: bytes | bytearray, fmt: object) -> None:
+        self.events.append(("pcm", (server_timestamp_us, bytes(data), fmt)))
+
+    def notify_discontinuity(self) -> None:
+        self.events.append(("clear", None))
+
+    def notify_stream_end(self) -> None:
+        self.events.append(("end", None))
+
+
+def test_handler_forwards_pcm_tap_to_worker(monkeypatch) -> None:
+    monkeypatch.setattr(audio_connector, "_AudioSyncWorker", _FakeWorker)
+    _FakeWorker.instances.clear()
+    tap = _RecordingTap()
+
+    handler = AudioStreamHandler(
+        audio_device=SimpleNamespace(index=0, name="Fake Device"),
+        volume=10,
+        muted=False,
+        pcm_tap=tap,
+    )
+    handler.attach_client(_FakeClient())
+
+    assert _FakeWorker.instances[0].pcm_tap is tap
+
+
+class _FakePlayer:
+    """Minimal AudioPlayer stand-in for driving the real worker loop."""
+
+    def __init__(self, *_args, **_kwargs) -> None:
+        self.submitted: list[tuple[int, bytes]] = []
+        self.cleared = 0
+        self.stream_closed = 0
+        self.stopped = False
+
+    def set_format(self, fmt: object, *, device: object) -> None:
+        return
+
+    def set_volume(self, volume: int, *, muted: bool) -> None:
+        return
+
+    def is_drained(self) -> bool:
+        return True
+
+    def submit(self, server_timestamp_us: int, payload: bytes | bytearray) -> None:
+        self.submitted.append((server_timestamp_us, bytes(payload)))
+
+    def clear(self) -> None:
+        self.cleared += 1
+
+    def close_stream(self) -> None:
+        self.stream_closed += 1
+
+    def stop(self) -> None:
+        self.stopped = True
+
+
+def _pcm_audio_format(sample_rate: int = 48000):
+    return SimpleNamespace(
+        codec=SimpleNamespace(value="pcm"),
+        pcm_format=SimpleNamespace(sample_rate=sample_rate, channels=2, bit_depth=16),
+    )
+
+
+def test_worker_taps_pcm_and_lifecycle_in_order(monkeypatch) -> None:
+    """The tap must see chunks and lifecycle signals in playout order."""
+    players: list[_FakePlayer] = []
+
+    def make_player(*args, **kwargs):
+        player = _FakePlayer(*args, **kwargs)
+        players.append(player)
+        return player
+
+    monkeypatch.setattr(audio_connector, "AudioPlayer", make_player)
+    tap = _RecordingTap()
+    worker = audio_connector._AudioSyncWorker(
+        audio_device=SimpleNamespace(index=0, name="Fake Device"),
+        use_software_volume=True,
+        volume=100,
+        muted=False,
+        pcm_tap=tap,
+    )
+    worker.start(lambda ts: ts, lambda ts: ts)
+
+    fmt = _pcm_audio_format()
+    worker.submit_chunk(1000, b"\x01\x02\x03\x04", fmt)
+    worker.submit_chunk(2000, b"\x05\x06\x07\x08", fmt)
+    worker.clear()
+    worker.submit_chunk(3000, b"\x09\x0a\x0b\x0c", fmt)
+    worker.close_stream()
+    asyncio.run(worker.stop())
+
+    kinds = [kind for kind, _ in tap.events]
+    assert kinds == ["pcm", "pcm", "clear", "pcm", "end", "end"]
+
+    pcm_events = [payload for kind, payload in tap.events if kind == "pcm"]
+    assert [(ts, data) for ts, data, _ in pcm_events] == [
+        (1000, b"\x01\x02\x03\x04"),
+        (2000, b"\x05\x06\x07\x08"),
+        (3000, b"\x09\x0a\x0b\x0c"),
+    ]
+    # The tap sees exactly what the player was handed.
+    assert players[0].submitted == [(ts, data) for ts, data, _ in pcm_events]
+
+
+def test_worker_tolerates_a_failing_tap(monkeypatch) -> None:
+    """A broken tap must never take playback down with it."""
+
+    class _BrokenTap:
+        def write_pcm(self, *_args) -> None:
+            raise RuntimeError("boom")
+
+        def notify_discontinuity(self) -> None:
+            raise RuntimeError("boom")
+
+        def notify_stream_end(self) -> None:
+            raise RuntimeError("boom")
+
+    players: list[_FakePlayer] = []
+
+    def make_player(*args, **kwargs):
+        player = _FakePlayer(*args, **kwargs)
+        players.append(player)
+        return player
+
+    monkeypatch.setattr(audio_connector, "AudioPlayer", make_player)
+    worker = audio_connector._AudioSyncWorker(
+        audio_device=SimpleNamespace(index=0, name="Fake Device"),
+        use_software_volume=True,
+        volume=100,
+        muted=False,
+        pcm_tap=_BrokenTap(),
+    )
+    worker.start(lambda ts: ts, lambda ts: ts)
+    worker.submit_chunk(1000, b"\x01\x02\x03\x04", _pcm_audio_format())
+    asyncio.run(worker.stop())
+
+    assert players[0].submitted == [(1000, b"\x01\x02\x03\x04")]

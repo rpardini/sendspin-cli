@@ -132,6 +132,10 @@ class ClientSettings(BaseSettings):
     interface: str | None = None
     # User-selected color theme ("dark" or "light"), re-engaged on next palette.
     color_mode: str | None = None
+    # Directory receiving one tagged audio file per played track (daemon mode).
+    export_dir: str | None = None
+    # Container for exported tracks: "flac" or "aiff" (daemon mode).
+    export_format: str | None = None
 
     def update(
         self,
@@ -155,6 +159,8 @@ class ClientSettings(BaseSettings):
         last_played_server_id: str | None = None,
         interface: str | None = None,
         color_mode: str | None = None,
+        export_dir: str | None = None,
+        export_format: str | None = None,
     ) -> None:
         """Update settings fields. Only changed fields trigger a save."""
         changed = False
@@ -188,6 +194,8 @@ class ClientSettings(BaseSettings):
                     "last_played_server_id": last_played_server_id,
                     "interface": interface,
                     "color_mode": color_mode,
+                    "export_dir": export_dir,
+                    "export_format": export_format,
                 }
             )
             or changed
@@ -231,6 +239,8 @@ class ClientSettings(BaseSettings):
             self.last_played_server_id = data.get("last_played_server_id")
             self.interface = data.get("interface")
             self.color_mode = data.get("color_mode")
+            self.export_dir = data.get("export_dir")
+            self.export_format = data.get("export_format")
             logger.info(
                 "Loaded settings from %s: volume=%d%%, muted=%s",
                 self._settings_file,

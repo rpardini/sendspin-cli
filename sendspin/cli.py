@@ -11,6 +11,7 @@ import sys
 import traceback
 from collections.abc import Sequence
 from importlib.metadata import version
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
 from sendspin.alsa_volume import AVAILABLE as ALSA_AVAILABLE
@@ -482,6 +483,25 @@ def _build_parser() -> argparse.ArgumentParser:
             "Useful when the system has multiple interfaces (e.g., LAN and WAN)."
         ),
     )
+    daemon_parser.add_argument(
+        "--export-dir",
+        type=str,
+        default=None,
+        help=(
+            "Directory to write each played track to as a tagged audio file. "
+            "Captures that cannot be verified as complete go to a '.partial' subdirectory. "
+            "Requires the server to send track metadata."
+        ),
+    )
+    daemon_parser.add_argument(
+        "--export-format",
+        type=str,
+        default=None,
+        # Mirrors sendspin.export.EXPORT_FORMATS, which is not imported here to keep
+        # PyAV out of the startup path; tests assert the two stay in sync.
+        choices=["flac", "aiff"],
+        help="Container for exported tracks (default: flac)",
+    )
 
     # audio-devices subcommand
     audio_devices_parser = subparsers.add_parser(
@@ -693,6 +713,21 @@ async def _run_serve_mode(args: argparse.Namespace) -> int:
     return await run_server(serve_config)
 
 
+def _resolve_export_dir(export_dir: str | None) -> Path | None:
+    """Expand and create the export directory, failing early if it is unusable."""
+    if not export_dir:
+        return None
+
+    resolved = Path(export_dir).expanduser()
+    try:
+        resolved.mkdir(parents=True, exist_ok=True)
+    except OSError as err:
+        raise CLIError(f"Cannot create export directory {resolved}: {err}") from err
+    if not os.access(resolved, os.W_OK):
+        raise CLIError(f"Export directory is not writable: {resolved}")
+    return resolved
+
+
 async def _run_daemon_mode(
     args: argparse.Namespace,
     settings: ClientSettings,
@@ -705,6 +740,8 @@ async def _run_daemon_mode(
     client_id, client_name = _resolve_client_info(args.id, args.name)
 
     daemon_args = DaemonArgs(
+        export_dir=_resolve_export_dir(args.export_dir),
+        export_format=args.export_format or "flac",
         audio_device=audio_device,
         url=args.url,
         client_id=client_id,
@@ -853,6 +890,11 @@ async def _run_client_mode(args: argparse.Namespace) -> int:
         args.product_name = settings.product_name
     if args.interface is None:
         args.interface = settings.interface
+    if is_daemon:
+        if args.export_dir is None:
+            args.export_dir = settings.export_dir
+        if args.export_format is None:
+            args.export_format = settings.export_format or "flac"
 
     # Set up logging: daemon uses stderr, TUI writes to sendspin.log
     # so log output doesn't interfere with the Rich display.

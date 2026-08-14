@@ -118,7 +118,9 @@ Settings are stored in `~/.config/sendspin/`:
   "hook_set_volume": "/usr/local/bin/set-avr-volume",
   "manufacturer": "Acme Corp",
   "product_name": "Living Room Speaker",
-  "interface": "192.168.1.5"
+  "interface": "192.168.1.5",
+  "export_dir": "/srv/music/captures",
+  "export_format": "flac"
 }
 ```
 
@@ -156,6 +158,8 @@ Settings are stored in `~/.config/sendspin/`:
 | `product_name` | string | TUI/daemon | Product name reported in the client hello (`--product-name`); defaults to auto-detected OS/platform name |
 | `interface` | string | TUI/daemon | IP address of the network interface to use (`--interface`) |
 | `visualizer` | boolean | TUI | Render the `visualizer@v1` audio visualizer on launch (default: false). Toggle with `v` in the TUI |
+| `export_dir` | string | daemon | Directory to write each played track to as a tagged audio file (`--export-dir`). Export is off when unset |
+| `export_format` | string | daemon | Container for exported tracks: `flac` or `aiff` (`--export-format`, default: `flac`) |
 | `source` | string | serve | Default audio source (file path or URL, ffmpeg input) |
 | `source_format` | string | serve | ffmpeg container format for audio source |
 | `clients` | array | serve | Client URLs to connect to (`--client`) |
@@ -296,6 +300,39 @@ Use `--manufacturer` and `--product-name` to override the device identity report
 sendspin daemon --name "Living Room" --manufacturer "Acme" --product-name "Living Room Speaker"
 ```
 
+### Track Export
+
+The daemon can write every track it plays to disk as a tagged audio file, turning a listening session into a capture:
+
+```bash
+sendspin daemon --export-dir ~/Music/captures --export-format flac
+```
+
+Files are named `Artist - Title.<ext>` directly in the export directory. Characters that are not safe in a filename (`/`, `:`, `*`, `?`, and friends) are replaced with `_`, and very long titles are truncated.
+
+```
+~/Music/captures/
+├── Radiohead - 15 Step.flac
+├── Radiohead - Bodysnatchers.flac
+└── .partial/
+    └── Radiohead - Nude.flac
+```
+
+**Formats:** `flac` (default) or `aiff`. Both are lossless. Audio is tapped after decoding but before playback timing adjustments, so files contain the PCM exactly as the server sent it, then re-encoded into the chosen container.
+
+**Tags written:** title, artist, album, album artist, year, and track number. Album art is not embedded.
+
+**The `.partial` subdirectory** holds captures that could not be verified as covering a whole track. A capture lands there when you join part-way into a song, skip before it ends, seek, the audio format changes mid-track, the stream stops mid-track, or the captured length disagrees with the duration the server reported. Tracks whose duration the server does not report (live streams) are judged purely by whether both ends fell on a track boundary.
+
+**Duplicates:** the first capture of a track wins. If a file of the same name already exists it is kept and the new capture is discarded, so replaying an album does not fill the directory with copies. A verified capture in the export directory also suppresses later partial captures of the same track.
+
+Notes and limitations:
+
+- Daemon mode only, and it requires the server to send track metadata — the daemon requests the `metadata` role automatically when export is enabled. Audio that arrives with no track title is discarded, since there would be nothing to name the file after.
+- Files appear roughly when a track finishes playing. Audio arrives several seconds ahead of playout, so the exporter holds it back briefly to cut track boundaries at the right sample.
+- FLAC caps out at 24 bits per sample, so a 32-bit source is written as 24-bit. Use `--export-format aiff` to keep all 32 bits.
+- Nothing limits how much is written. A long-running daemon will keep filling the disk.
+
 ### Hooks
 
 You can run external commands when audio streams start or stop. This is useful for controlling amplifiers, lighting, or other home automation:
@@ -343,6 +380,8 @@ sendspin --log-level DEBUG
 ```
 
 This provides detailed information about time synchronization. The output can be helpful when reporting issues.
+
+With `--export-dir`, `DEBUG` also logs where each track boundary was placed and by how much it missed the audio, which is the first thing to check if exported files are split at the wrong point. In-progress exports live in a `.tmp` subdirectory of the export directory; leftovers from a daemon that was killed mid-track are removed the next time it starts.
 
 ### Network Interface Binding
 
